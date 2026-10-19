@@ -1,45 +1,49 @@
 const express = require('express');
-const { prisma } = require('../../../prismaClient');
-const { normalizeNameTag, etagCache, USER_DATABASE } = require('../../db');
+const db = require('../../db');
+const normalizeNameTag = db.normalizeNameTag || ((v) => v);
+const etagCache = db.etagCache || ((_req, _res, next) => next());
 const {
   federationNameKey,
   federationIdKey,
   federationLookupCached,
 } = require('../../cache');
+const { validateSchema } = require('../../middleware/validateSchema');
+const { ApiError } = require('../../errors');
+const { federationQuerySchema } = require('../../schemas');
+const { asyncHandler } = require('../../middleware/asyncHandler');
+const { resolveFederationId, resolveFederationName } = require('../../services/federationService');
+const { createTokenBucketLimiter } = require('../../middleware/tokenBucketLimiter');
 
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/federation', etagCache, async (req, res, next) => {
-    const { q, type } = req.query;
-    const queryValue = typeof q === 'string' ? q.trim() : '';
+  const ipLimiter = createTokenBucketLimiter(redisClient, {
+    capacity: 100,
+    refillRate: 100 / (15 * 60),
+    prefix: 'ip-rl:',
+    keyGenerator: (req) =>
+      req.ip || (req.connection && req.connection.remoteAddress) || '',
+  });
 
-    if (!queryValue) {
-      const error = new Error("Missing 'q' parameter");
-      error.statusCode = 400;
-      return next(error);
-    }
+/**
+ * @openapi
+ * /federation:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /federation
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get('/federation', ipLimiter, etagCache, validateSchema({ query: federationQuerySchema }), asyncHandler(async (req, res, next) => {
+    const { q: queryValue, type } = req.query;
 
     try {
       if (type === 'id') {
         const cacheKey = federationIdKey(queryValue);
         const cached = await federationLookupCached(cacheKey, async () => {
-          const row = await prisma.user.findFirst({
-            where: { address: { equals: queryValue, mode: 'insensitive' } },
-            select: { username: true, address: true, memoType: true, memo: true },
-          });
-
-          if (!row) return null;
-
-          const response = {
-            stellar_address: `${row.username}*${process.env.DOMAIN || 'localhost'}`,
-            account_id: row.address,
-          };
-          if (row.memoType) {
-            response.memo_type = row.memoType;
-            response.memo = row.memo;
-          }
-          return response;
+          return await resolveFederationId(queryValue);
         });
 
         if (!cached) {
@@ -55,23 +59,7 @@ module.exports = (redisClient) => {
         const cacheKey = federationNameKey(queryName);
 
         const cached = await federationLookupCached(cacheKey, async () => {
-          const row = await prisma.user.findUnique({
-            where: { username: queryName },
-            select: { address: true, memoType: true, memo: true },
-          });
-
-          const address = row?.address || USER_DATABASE[queryName];
-          if (!address) return null;
-
-          const response = {
-            stellar_address: address,
-            account_id: address,
-          };
-          if (row?.memoType) {
-            response.memo_type = row.memoType;
-            response.memo = row.memo;
-          }
-          return response;
+          return await resolveFederationName(queryName);
         });
 
         if (!cached) {
@@ -82,16 +70,19 @@ module.exports = (redisClient) => {
 
         return res.json(cached);
       } else {
-        return res.status(400).json({
-          error: "Unsupported query type. Supported types: 'id', 'name'",
-        });
+        return next(
+          new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
+        );
       }
     } catch (error) {
+      if (error.statusCode === 403) {
+        return next(error);
+      }
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);
     }
-  });
+  }));
 
   return router;
 };
